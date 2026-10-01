@@ -120,7 +120,6 @@ class MultiprocExecutor(Executor):
         # and ensure workers will be terminated.
         self._finalizer = weakref.finalize(self, self.shutdown)
         self.is_failed = False
-        self.last_worker_error: str | None = None
         self.failure_callback: FailureCallback | None = None
 
         tp_size, pp_size, pcp_size = self._get_parallel_sizes()
@@ -207,6 +206,7 @@ class MultiprocExecutor(Executor):
                 if inherited_fds is not None:
                     inherited_fds.append(unready_worker_handle.death_writer.fileno())
                     inherited_fds.append(unready_worker_handle.ready_pipe.fileno())
+                    inherited_fds.append(unready_worker_handle.error_reader.fileno())
 
             # Workers must be created before wait_for_ready to avoid
             # deadlock, since worker.init_device() does a device sync.
@@ -262,6 +262,9 @@ class MultiprocExecutor(Executor):
                     if uw.death_writer is not None:
                         uw.death_writer.close()
                         uw.death_writer = None
+                    if uw.error_reader is not None:
+                        uw.error_reader.close()
+                        uw.error_reader = None
                 self._ensure_worker_termination([uw.proc for uw in unready_workers])
 
         self.output_rank = self._get_output_rank()
@@ -300,14 +303,14 @@ class MultiprocExecutor(Executor):
         workers = self.workers
         self_ref = weakref.ref(self)
 
-        # Monitors worker process liveness. If any die unexpectedly,
-        # logs an error, shuts down the executor and invokes the failure
-        # callback to inform the engine.
+        # Monitor worker liveness and fatal inference errors. A failed worker
+        # may still be alive with peers blocked in a collective.
         def monitor_workers():
             handles = {
                 target: h
                 for h in workers
                 for target in (h.proc.sentinel, h.error_reader)
+                if target is not None
             }
             ready = multiprocessing.connection.wait(handles.keys())
             _self = self_ref()
@@ -325,21 +328,14 @@ class MultiprocExecutor(Executor):
                     worker.proc.name,
                     worker.proc.exitcode,
                 )
-            elif isinstance(target, Connection):
-                try:
-                    err_msg, tb = target.recv()
-                    logger.error(
-                        "Worker proc %s encountered exception: %s\n%s",
-                        worker.proc.name,
-                        err_msg,
-                        tb,
-                    )
-                except EOFError:
-                    logger.error(
-                        "Worker proc %s error pipe closed unexpectedly, "
-                        "shutting down executor.",
-                        worker.proc.name,
-                    )
+            else:
+                # Readiness alone is the failure signal. Never receive a framed
+                # payload here: an incomplete write could block failure handling.
+                logger.error(
+                    "Worker proc %s signaled a fatal error or closed its error "
+                    "pipe; shutting down executor. See worker logs for details.",
+                    worker.proc.name,
+                )
 
             _self.shutdown()
             callback = _self.failure_callback
@@ -748,7 +744,7 @@ class WorkerProc:
         ready_reader, ready_writer = context.Pipe(duplex=False)
         # Death pipe to let child detect parent process exit
         death_reader, death_writer = context.Pipe(duplex=False)
-        # Error pipe to report unhandled worker exceptions to executor monitor
+        # Closing the writer signals fatal failure without sending a payload.
         error_reader, error_writer = context.Pipe(duplex=False)
         if inherited_fds is not None:
             inherited_fds = inherited_fds.copy()
@@ -1098,11 +1094,17 @@ class WorkerProc:
             if hasattr(e, "add_note"):
                 e.add_note(traceback.format_exc())
             logger.exception("WorkerProc hit an exception.")
-            # Report exception to executor monitor thread immediately
-            # so collectives don't deadlock
-            if self.error_writer is not None:
-                with suppress(Exception):
-                    self.error_writer.send((str(e), traceback.format_exc()))
+            # Inference failures can strand peers in collectives. Utility RPCs
+            # (e.g. an invalid LoRA load) instead return a recoverable error.
+            if self.error_writer is not None and method in (
+                "execute_model",
+                "sample_tokens",
+                "execute_dummy_batch",
+                "take_draft_token_ids",
+            ):
+                # EOF wakes the monitor even if worker cleanup later blocks.
+                self.error_writer.close()
+                self.error_writer = None
             # enqueue_output converts the exception to a FAILURE response
             # containing its string representation before transport.
             if output_rank is None or self.rank == output_rank:
