@@ -6,12 +6,19 @@ import multiprocessing
 import os
 import struct
 import threading
+from collections import deque
 from types import SimpleNamespace
 from typing import Any
 
 import pytest
+import zmq
 
-from vllm.v1.executor.multiproc_executor import MultiprocExecutor, WorkerProc
+from vllm.distributed.device_communicators.shm_broadcast import MessageQueue
+from vllm.v1.executor.multiproc_executor import (
+    FutureWrapper,
+    MultiprocExecutor,
+    WorkerProc,
+)
 
 
 @pytest.fixture
@@ -96,6 +103,7 @@ def test_monitor_fails_executor_on_error_pipe_event(error_pipe, signal_failure):
     executor.is_failed = False
     executor.shutdown = lambda: calls.append("shutdown")
     executor.failure_callback = lambda: calls.append("failure_callback")
+    executor.response_mqs = []
     executor.workers = [
         SimpleNamespace(
             proc=SimpleNamespace(
@@ -119,3 +127,199 @@ def test_monitor_fails_executor_on_error_pipe_event(error_pipe, signal_failure):
     assert not alive, "monitor did not react to the error pipe"
     assert executor.is_failed
     assert calls == ["shutdown", "failure_callback"]
+
+
+@pytest.fixture
+def remote_queue():
+    writer = MessageQueue(1, 0, connect_ip="127.0.0.1")
+    reader = MessageQueue.create_from_handle(writer.export_handle(), -1)
+    # Arm before the test's monitor thread starts so disconnect delivery does
+    # not depend on that thread being scheduled before the publisher closes.
+    monitor = reader.remote_socket.get_monitor_socket(events=zmq.EVENT_DISCONNECTED)
+    for mq in (writer, reader):
+        mq.remote_socket.setsockopt(zmq.RCVTIMEO, 10000)
+    writer.wait_until_ready()
+    reader.wait_until_ready()
+    try:
+        yield writer, reader
+    finally:
+        monitor.close(linger=0)
+        for mq in (writer, reader):
+            mq.remote_socket.context.destroy(linger=0)
+
+
+def _wait_for_parent(death_reader, error_writer, ready):
+    ready.set()
+    try:
+        death_reader.recv()
+    except EOFError:
+        pass
+    finally:
+        death_reader.close()
+        error_writer.close()
+
+
+@pytest.fixture
+def executor_with_remote_queue(remote_queue):
+    _, reader = remote_queue
+    context = multiprocessing.get_context("spawn")
+    death_reader, death_writer = context.Pipe(duplex=False)
+    error_reader, error_writer = context.Pipe(duplex=False)
+    ready = context.Event()
+    proc = context.Process(
+        target=_wait_for_parent, args=(death_reader, error_writer, ready)
+    )
+    proc.start()
+    death_reader.close()
+    error_writer.close()
+    assert ready.wait(30)
+    failed = threading.Event()
+    executor: Any = MultiprocExecutor.__new__(MultiprocExecutor)
+    executor.is_failed = False
+    executor.failure_callback = failed.set
+    executor.response_mqs = [reader]
+    executor.workers = [
+        SimpleNamespace(
+            proc=proc,
+            error_reader=error_reader,
+            death_writer=death_writer,
+            worker_response_mq=None,
+        )
+    ]
+    errors = []
+
+    def run_monitor():
+        try:
+            executor.start_worker_monitor(inline=True)
+        except Exception as error:
+            errors.append(error)
+
+    monitor = threading.Thread(target=run_monitor, daemon=True)
+    monitor.start()
+    try:
+        yield executor, proc, failed, monitor
+    finally:
+        executor.shutdown()
+        proc.join(10)
+        if proc.is_alive():
+            proc.kill()
+            proc.join(10)
+        monitor.join(10)
+        assert not monitor.is_alive()
+        assert not errors
+        error_reader.close()
+        death_writer.close()
+        proc.close()
+
+
+def test_remote_worker_disconnect_fails_executor(
+    remote_queue, executor_with_remote_queue
+):
+    writer, _ = remote_queue
+    executor, proc, failed, monitor = executor_with_remote_queue
+    writer.remote_socket.close(linger=0)
+
+    assert failed.wait(5), "remote worker loss did not reach the engine"
+    monitor.join(5)
+    proc.join(5)
+    assert executor.is_failed
+    assert not monitor.is_alive()
+    assert proc.exitcode == 0, "local worker did not receive the shutdown request"
+
+
+def test_normal_shutdown_with_remote_worker_is_not_a_failure(
+    executor_with_remote_queue,
+):
+    executor, proc, failed, monitor = executor_with_remote_queue
+    executor.shutdown()
+    monitor.join(5)
+    proc.join(5)
+
+    assert not monitor.is_alive()
+    assert proc.exitcode == 0
+    assert not executor.is_failed
+    assert not failed.is_set()
+
+
+def test_coordinator_disconnect_notifies_headless_parent(
+    error_pipe, remote_queue, monkeypatch
+):
+    error_reader, error_writer = error_pipe
+    writer, reader = remote_queue
+    death_reader, death_writer = multiprocessing.Pipe(duplex=False)
+    shutdown_requested = threading.Event()
+    monitor_threads = []
+
+    def make_monitor_thread(**kwargs):
+        thread = threading.Thread(**kwargs)
+        monitor_threads.append(thread)
+        return thread
+
+    monkeypatch.setattr(
+        "vllm.v1.executor.multiproc_executor.Thread", make_monitor_thread
+    )
+    worker: Any = WorkerProc.__new__(WorkerProc)
+    worker.rpc_broadcast_mq = reader
+    worker.worker_response_mq = None
+    worker.error_writer = error_writer
+    worker.monitor_death_pipe(death_reader, shutdown_requested)
+    try:
+        writer.remote_socket.close(linger=0)
+        assert error_reader.poll(5), "coordinator loss did not reach the local executor"
+        assert shutdown_requested.wait(5)
+    finally:
+        death_writer.close()
+        assert shutdown_requested.wait(5)
+        # The queue context must outlive its monitor's final shutdown call.
+        for thread in monitor_threads:
+            thread.join(5)
+            assert not thread.is_alive()
+        death_reader.close()
+
+
+@pytest.mark.parametrize("timeout", [None, 30])
+def test_shutdown_cancels_pending_remote_response(remote_queue, timeout):
+    writer, reader = remote_queue
+    future = FutureWrapper(deque(), lambda: reader.dequeue(timeout=timeout))
+    started = threading.Event()
+    errors = []
+
+    def receive():
+        started.set()
+        try:
+            future.result()
+        except Exception as error:
+            errors.append(error)
+
+    receiver = threading.Thread(target=receive, daemon=True)
+    receiver.start()
+    assert started.wait(5)
+    try:
+        reader.shutdown()
+        receiver.join(5)
+        assert not receiver.is_alive(), "shutdown left the remote response blocked"
+        assert len(errors) == 1
+        assert isinstance(errors[0], RuntimeError)
+    finally:
+        if receiver.is_alive():
+            # Release a broken implementation without destroying a socket that
+            # another thread is still polling.
+            writer.enqueue(None)
+            receiver.join(5)
+        assert not receiver.is_alive()
+
+
+def test_shutdown_rejects_queued_remote_response(remote_queue):
+    writer, reader = remote_queue
+    writer.enqueue("stale response")
+    reader.shutdown()
+    with pytest.raises(RuntimeError):
+        reader.dequeue(timeout=5)
+
+
+def test_remote_receive_timeout_preserves_queue(remote_queue):
+    writer, reader = remote_queue
+    with pytest.raises(TimeoutError):
+        reader.dequeue(timeout=0)
+    writer.enqueue("response after timeout")
+    assert reader.dequeue(timeout=5) == "response after timeout"
