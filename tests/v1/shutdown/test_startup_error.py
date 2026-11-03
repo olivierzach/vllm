@@ -30,7 +30,7 @@ def evil_method(self, *args, **kwargs):
 
 
 @pytest.fixture
-def rocm_evil_method(rocm_sitecustomize_factory, request):
+def evil_method_fixture(spawn_sitecustomize_factory, request):
     failing_method = request.getfixturevalue("failing_method")
     lines = [
         "from vllm.distributed import get_tensor_model_parallel_rank",
@@ -38,7 +38,7 @@ def rocm_evil_method(rocm_sitecustomize_factory, request):
         inspect.getsource(evil_method),
         f"LlamaForCausalLM.{failing_method} = {evil_method.__name__}",
     ]
-    rocm_sitecustomize_factory(lines)
+    spawn_sitecustomize_factory(lines)
 
 
 @pytest.mark.timeout(SHUTDOWN_TEST_TIMEOUT_SEC)
@@ -47,7 +47,7 @@ def rocm_evil_method(rocm_sitecustomize_factory, request):
 @pytest.mark.parametrize("failing_method", ["forward", "load_weights"])
 def test_async_llm_startup_error(
     monkeypatch,
-    rocm_evil_method,
+    evil_method_fixture,
     model: str,
     tensor_parallel_size: int,
     failing_method: str,
@@ -84,7 +84,7 @@ def test_async_llm_startup_error(
 @pytest.mark.parametrize("failing_method", ["forward", "load_weights"])
 def test_llm_startup_error(
     monkeypatch,
-    rocm_evil_method,
+    evil_method_fixture,
     model: str,
     tensor_parallel_size: int,
     enable_multiprocessing: bool,
@@ -138,20 +138,20 @@ def evil_forward_on_rank_1(self, *args, **kwargs):
 
 
 @pytest.fixture
-def rocm_evil_forward_on_rank_1(rocm_sitecustomize_factory):
+def evil_forward_on_rank_1_fixture(spawn_sitecustomize_factory):
     lines = [
         "from vllm.distributed import get_tensor_model_parallel_rank",
         "from vllm.model_executor.models.llama import LlamaForCausalLM",
         inspect.getsource(evil_forward_on_rank_1),
         f"LlamaForCausalLM.forward = {evil_forward_on_rank_1.__name__}",
     ]
-    rocm_sitecustomize_factory(lines)
+    spawn_sitecustomize_factory(lines)
 
 
 @pytest.mark.timeout(SHUTDOWN_TEST_TIMEOUT_SEC)
 @pytest.mark.parametrize("model", MODELS)
 def test_async_llm_startup_error_with_peer_in_collective(
-    monkeypatch, rocm_evil_forward_on_rank_1, model: str
+    monkeypatch, evil_forward_on_rank_1_fixture, model: str
 ) -> None:
     """Test that a startup error on one rank fails fast instead of hanging
     while another rank is blocked in a collective waiting for it."""
